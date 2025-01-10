@@ -45,12 +45,15 @@ def get_file(case_number, file_type, file_dir):
 
 
 def cover_sheet_last_page_image(case_number, file_dir):
-    """ Gets the last page of the cover sheet, assuming it should have at least 
-        6 pages. 
+    """ Gets the last page of the cover sheet. 
         
         Note that the address is almost always on the 6th page (occasionally 
         there is a 7th page that it will be found on, sometimes there are fewer 
-        pages and missing an address)
+        pages and missing an address). However, sometimes the fewer pages do still have
+        an address so we want to check those just to make sure we're not missing something. 
+        
+        To do: find a way to confirm that the last page has an address, so we don't waste a bunch of time trying to find boxes that don't exist
+        (but also don't exclude boxes that should be included)
     
         Args:
             case_number (str): case identifier, alphanumeric
@@ -71,12 +74,12 @@ def cover_sheet_last_page_image(case_number, file_dir):
 
     # convert pdf to image
     # the address is almost always on the last (6th) sheet
-    images = convert_from_path(fpaths[0], dpi=DPI, first_page=6)
+    images = convert_from_path(fpaths[0], dpi=DPI, first_page=1)
 
     # not all civil case cover sheets have 6 pages, which means they might be missing the address in that document, so test for that
     if len(images) == 0:
         raise Exception(
-            'civil case cover sheet does not have 6 pages as expected; likely missing address'
+            'civil case cover sheet does not have any pages, so that\'s weird'
         )
     last_page_image = images[-1]
 
@@ -101,7 +104,6 @@ def address_autocrop(last_page_image):
     last_page_image = last_page_image[top_crop:half_height, :]
 
     ## create the pipeline configs for the box detectors for the street address box, city box, and state/zip boxes ##
-
     ADDRESS_CFG = config.PipelinesConfig()
     # important to adjust these values to match the size of boxes on your image
     ADDRESS_CFG.width_range = (800, 1500)
@@ -145,6 +147,7 @@ def address_autocrop(last_page_image):
     street_address_bbox_candidates, _, _, _ = get_boxes(last_page_image_right,
                                                         cfg=ADDRESS_CFG,
                                                         plot=False)
+    
     # if no boxes detected, its likely because the scan was rotated. the box detection algorithm is super sensitive to angle (i.e. within 0.2 degrees), so we rotate the image +- 0.1 degrees until we can detect boxes
     max_rot = 2
     if len(street_address_bbox_candidates) == 0:
@@ -195,7 +198,7 @@ def address_autocrop(last_page_image):
                                                       cfg=CITY_CFG,
                                                       plot=False)
             if len(city_bbox_candidates) != 0:
-                print(f'box detected successfully at {deg} degree rotation')
+                print(f'city box detected successfully at {deg} degree rotation')
                 break
 
             # if that doesn't work, rotate in the opposite direction
@@ -206,13 +209,13 @@ def address_autocrop(last_page_image):
                                                       cfg=CITY_CFG,
                                                       plot=False)
             if len(city_bbox_candidates) != 0:
-                print(f'box detected successfully at {deg} degree rotation')
+                print(f'city box detected successfully at {deg} degree rotation')
                 break
 
     # verify if the city_bbox_candidates has valid boxes or if its empty
     if len(city_bbox_candidates) == 0:
         raise Exception(
-            f'could not detect address box within +-{max_rot} degrees of rotation'
+            f'could not detect city box within +-{max_rot} degrees of rotation'
         )
 
     state_zip_bbox_candidates, _, _, _ = get_boxes(last_page_image,
@@ -232,7 +235,7 @@ def address_autocrop(last_page_image):
                                                            cfg=STATEZIP_CFG,
                                                            plot=False)
             if len(state_zip_bbox_candidates) >= 2:
-                print(f'boxes detected successfully at {deg} degree rotation')
+                print(f'state/zip boxes detected successfully at {deg} degree rotation')
                 break
 
             # if that doesn't work, rotate in the opposite direction
@@ -243,7 +246,7 @@ def address_autocrop(last_page_image):
                                                            cfg=STATEZIP_CFG,
                                                            plot=False)
             if len(state_zip_bbox_candidates) >= 2:
-                print(f'box detected successfully at {deg} degree rotation')
+                print(f'state/zip boxes detected successfully at {deg} degree rotation')
                 break
     # verify if the state_zip_bbox_candidates has valid boxes or if its empty
     if len(state_zip_bbox_candidates) < 2:
@@ -342,7 +345,7 @@ def address_from_crops(address_crop,
         Returns: tuple of strings containing street address, city, state, and zip code, if extraction was successful 
     """
     # run OCR on the crops
-    tesseract_config = f"--oem 1 --dpi {DPI}"
+    tesseract_config = f"--oem 1 --dpi {DPI} -c tessedit_char_whitelist=\" /abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.\""
     # NOTE the tesseract characte whitelist only works for the legacy mode, not the newer neural net/LSTM mode, which apparently doesn't respect the whitelist - so we can't really force it to exclude weird punctuation or diacritics
     #  (https://stackoverflow.com/a/49030935/10536083)
     streetaddress_texts = pytesseract.image_to_string(address_crop,
@@ -356,6 +359,7 @@ def address_from_crops(address_crop,
     #### extract the address info from the text blocks ####
     # drop the text containing "CITY"/"ADDRESS"/etc, remove punctuation, strip whitespace
     # TODO filter out artifacts of OCR, like random characters like -_:;'" (note we can't filter out periods or commas because those could be valid instances in the address) (usually commas for separating street/apt, and periods following the street abbreviation)
+    # EDIT: tried to fix this (Elena Miller)
 
     ## extract street address ##
     # strip whitespace so that it should start with 'ADDRESS'
@@ -363,17 +367,30 @@ def address_from_crops(address_crop,
     address_start_idx = streetaddress_texts.upper().find('ADDRESS')
     # also check for typos of ADDRESS
     # TODO create a more flexible way of checking for typos using edit distance
+    # Elena - maybe we could do address checking by making sure some combinations of letters are right? Like: AD or DR or RE or ES or SS? Shouldn't be in any of the other options
+    # This feels like reusing if a lot...
     if address_start_idx == -1:
         address_start_idx = streetaddress_texts.upper().find('ADORESS')
     if address_start_idx == -1:
         address_start_idx = streetaddress_texts.upper().find('AOORESS')
     if address_start_idx == -1:
         address_start_idx = streetaddress_texts.upper().find('AODRESS')
+    if address_start_idx == -1:
+        address_start_idx = streetaddress_texts.upper().find('AD')
+    if address_start_idx == -1:
+        address_start_idx = streetaddress_texts.upper().find('DR')
+    if address_start_idx == -1:
+        address_start_idx = streetaddress_texts.upper().find('RE')
+    if address_start_idx == -1:
+        address_start_idx = streetaddress_texts.upper().find('ES')
+    if address_start_idx == -1:
+        address_start_idx = streetaddress_texts.upper().find('SS')
     assert address_start_idx != -1, f'the street address block should start with ADDRESS but could not find that word in: {streetaddress_texts}'
 
     # remove the starting text corresponding to 'ADDRESS'
     streetaddress = streetaddress_texts[address_start_idx + len('ADDRESS'):]
     # remove the semicolon, or similar punctuation that the OCR might've misinterpreted for the semicolon. sometimes it doesn't catch the semicolon so we also need to check for that
+    # Elena - I don't think we need this anymore?
     streetaddress = streetaddress.strip()
     if streetaddress[0] in [':', ';', ',', '.', '\'']:
         streetaddress = streetaddress[1:]
@@ -389,12 +406,18 @@ def address_from_crops(address_crop,
     city_texts = city_texts.strip()
     city_start_idx = city_texts.upper().find('CITY')
     # also check for typos of CITY (I've seen CHY, OI, Ciry)
+    # Elena - maybe we can determine ways "CITY" is different from State/Zip Code and check for just that? For example, Y?
+    # I don't think we need the first two if statements but can't hurt to leave in for now?
     if city_start_idx == -1:
         city_start_idx = city_texts.upper().find('CHY')
     if city_start_idx == -1:
         city_start_idx = city_texts.upper().find('CIRY')
+    if city_start_idx == -1:
+        city_start_idx = city_texts.upper().find('Y')
+
     assert city_start_idx != -1, f'the city block should start with CITY but could not find that word in: {city_texts}'
     # remove the starting text corresponding to 'CITY'
+    # Elena - right now, it's stripping 'CITY' even if only 'ITY' is found - this is causing some errors in it stripping the first part of the city
     city = city_texts[city_start_idx + len('CITY'):]
     city = city.strip()
     # remove the semicolon, or similar punctuation that the OCR might've misinterpreted for the semicolon. sometimes it doesn't catch the semicolon so we also need to check for that
@@ -407,6 +430,14 @@ def address_from_crops(address_crop,
     # strip whitespace so that it should start with 'STATE'
     state_texts = state_texts.strip()
     state_start_idx = state_texts.upper().find('STATE')
+    if state_start_idx == -1:
+        state_start_idx = state_texts.upper().find('ST')
+    if state_start_idx == -1:
+        state_start_idx = state_texts.upper().find('TA')
+    if state_start_idx == -1:
+        state_start_idx = state_texts.upper().find('AT')
+    if state_start_idx == -1:
+        state_start_idx = state_texts.upper().find('TE')
     assert state_start_idx != -1, f'the state block should start with STATE but could not find that word in: {state_texts}'
     # remove the starting text corresponding to 'STATE'
     state = state_texts[state_start_idx + len('STATE'):]
@@ -416,14 +447,27 @@ def address_from_crops(address_crop,
         state = state[1:]
         # strip any remaining whitespace
         state = state.strip()
+    #state = re.findall(r'[A-Z]{2}', state)
 
     ## extract zip code ##
     # strip whitespace so that it should start with 'ZIP'
     zip_texts = zip_texts.strip()
     zip_start_idx = zip_texts.upper().find('ZIP')
     # also check for typos of ZIP
+    # Elena - adding in the same idea of looking for two strings
     if zip_start_idx == -1:
         zip_start_idx = zip_texts.upper().find('21P')
+    if zip_start_idx == -1:
+        zip_start_idx = zip_texts.upper().find('2IP')
+    if zip_start_idx == -1:
+        zip_start_idx = zip_texts.upper().find('ZI')
+    if zip_start_idx == -1:
+        zip_start_idx = zip_texts.upper().find('IP')
+    if zip_start_idx == -1:
+        zip_start_idx = zip_texts.upper().find('2I')
+    if zip_start_idx == -1:
+        zip_start_idx = zip_texts.upper().find('1P')
+    
     assert zip_start_idx != -1, f'the zip block should start with ZIP but could not find that word in: {zip_texts}'
     # remove the starting text corresponding to 'ZIP'
     zip_texts = zip_texts[zip_start_idx + len('ZIP'):]
@@ -432,6 +476,13 @@ def address_from_crops(address_crop,
     # strip again to get rid of whitespace before CODE
     zip_texts = zip_texts.strip()
     code_start_idx = zip_texts.upper().find('CODE')
+    # Elena - again adding the same logic
+    if code_start_idx == -1:
+        code_start_idx = zip_texts.upper().find('CO')
+    if code_start_idx == -1:
+        code_start_idx = zip_texts.upper().find('OD')
+    if code_start_idx == -1:
+        code_start_idx = zip_texts.upper().find('DE')
     assert code_start_idx != -1, f'the zip block should have CODE as the second word but could not find that word in: {zip_texts}'
     # remove the starting text corresponding to 'CODE'
     zip_texts = zip_texts[code_start_idx + len('CODE'):]
@@ -608,6 +659,7 @@ def extract_init_demand(case_number, file_dir, verbose=False):
     #     * PRAYER AMOUNT: $XXXXX.XX
     #     * PRAYER AMT: $XXXXX.XX
     #     * LIMITED CIVIL: $XXXXX.XX
+    #     ** DEMAND = $XXXXX.XX //Elena added
     # * page 2:
     #     * 10. Plaintiff prays for judgment for costs of suit; for such
     #       relief as is fair, just, and equitable; and for a. damages of:
@@ -620,12 +672,13 @@ def extract_init_demand(case_number, file_dir, verbose=False):
     # use regex to extract monetary amount
     prayer_amount_regex = "[pP][rR][aA][yY][eE][rR]\s*[aA][mM][oO][uU][nN][tT]\s*[:;,.-]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
     prayer_amt_regex = "[pP][rR][aA][yY][eE][rR]\s*[aA][mM][tT]\s*[:;,.-]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
-    demand_regex = "[dD][eE][mM][aA][nN][dD]\s*[:;,.-]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
+    demand_regex = "[dD][eE][mM][aA][nN][dD]\s*[:;,.-=]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
     demand_amount_regex = "[dD][eE][mM][aA][nN][dD]\s*[aA][mM][oO][uU][nN][tT]\s*[:;,.-]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
     amount_demanded_regex = "[aA][mM][oO][uU][nN][tT]\s*[dD][eE][mM][aA][nN][dD][eE][dD]\s*[:;,.-]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
     demand_is_for_regex = "[dD][eE][mM][aA][nN][dD]\s*[iI][sS]\s*[fF][oO][rR]\s*[:;,.-]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
     limited_civil_regex = "[lLiI][iIl][mM][iIl][tT][eE][dD]\s*[cC][iIl][vV][iIl][lLiI]\s*[:;,.-]?\s*[$Ss]\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"
     damages_of_regex = "damages\s*of\s*[:;,.-]?\s*[$Ss]\s*[$]?\s*(\d{0,2}[,.]?\d{0,3}[.,]?\d{2})"  # sometimes there are sheets with 2 dollar signs..
+
     # TODO figure out a way to make these more robust to OCR typos
     # note sometimes the decimal point in the monetary value doesn't get detected by OCR, hence why we make them optional in the regex pattern
     prayer_amount_results = re.findall(prayer_amount_regex, first_page_text)
